@@ -1,0 +1,29 @@
+name: RSI Alert Scan
+
+on:
+  schedule:
+    # Chạy mỗi 15 phút (giờ UTC, GitHub không hỗ trợ giờ VN trực tiếp)
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    # Cho phép bấm nút "Run workflow" để chạy thử thủ công
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run RSI scan
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python rsi_scan.py
