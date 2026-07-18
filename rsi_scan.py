@@ -37,7 +37,7 @@ def send_telegram_message(text: str):
 
 def get_all_usdt_symbols():
     url = f"{BINANCE_BASE}/api/v3/exchangeInfo"
-    r = requests.get(url, timeout=15)
+    r = requests.get(url, timeout=30)
     r.raise_for_status()
     data = r.json()
     symbols = []
