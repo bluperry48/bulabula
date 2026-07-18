@@ -10,7 +10,7 @@ import os
 import time
 import requests
 
-BINANCE_BASE = "https://api.binance.com"
+BINANCE_BASE = "https://data-api.binance.vision"
 
 # Đọc từ GitHub Secrets (biến môi trường)
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
