@@ -10,7 +10,8 @@ import os
 import time
 import requests
 
-BINANCE_BASE = "https://data-api.binance.vision"
+BINANCE_SPOT_BASE = "https://data-api.binance.vision"
+BINANCE_FUTURES_BASE = "https://fapi.binance.com"
 
 # Đọc từ GitHub Secrets (biến môi trường)
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -35,9 +36,9 @@ def send_telegram_message(text: str):
         print(f"[Telegram] Exception: {e}")
 
 
-def get_all_usdt_symbols():
-    url = f"{BINANCE_BASE}/api/v3/exchangeInfo"
-    r = requests.get(url, timeout=30)
+def get_all_spot_usdt_symbols():
+    url = f"{BINANCE_SPOT_BASE}/api/v3/exchangeInfo"
+    r = requests.get(url, timeout=15)
     r.raise_for_status()
     data = r.json()
     symbols = []
@@ -51,8 +52,29 @@ def get_all_usdt_symbols():
     return sorted(symbols)
 
 
-def get_klines(symbol: str, interval: str, limit: int = 100):
-    url = f"{BINANCE_BASE}/api/v3/klines"
+def get_all_futures_usdt_symbols():
+    """Lấy danh sách cặp Futures USDT-M. Trả về [] nếu bị chặn/lỗi."""
+    url = f"{BINANCE_FUTURES_BASE}/fapi/v1/exchangeInfo"
+    try:
+        r = requests.get(url, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        symbols = []
+        for s in data["symbols"]:
+            if (
+                s["quoteAsset"] == QUOTE_ASSET
+                and s["status"] == "TRADING"
+                and s["contractType"] == "PERPETUAL"
+            ):
+                symbols.append(s["symbol"])
+        return sorted(symbols)
+    except Exception as e:
+        print(f"[Futures] Không lấy được danh sách Futures: {e}")
+        return []
+
+
+def get_klines(base_url: str, path: str, symbol: str, interval: str, limit: int = 100):
+    url = f"{base_url}{path}"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     r = requests.get(url, params=params, timeout=10)
     r.raise_for_status()
@@ -76,15 +98,12 @@ def calculate_rsi(closes, period: int = 14):
     return round(100 - (100 / (1 + rs)), 2)
 
 
-def main():
-    print("Bắt đầu quét (1 lần)...")
-    symbols = get_all_usdt_symbols()
-    print(f"Tổng số cặp USDT: {len(symbols)}")
-
+def scan_market(market_label, base_url, klines_path, symbols):
+    """Quét 1 danh sách symbol của 1 thị trường (Spot hoặc Futures), trả về số cảnh báo đã gửi."""
     alerts_sent = 0
     for symbol in symbols:
         try:
-            klines = get_klines(symbol, INTERVAL, limit=RSI_PERIOD * 3)
+            klines = get_klines(base_url, klines_path, symbol, INTERVAL, limit=RSI_PERIOD * 3)
             closes = [float(k[4]) for k in klines]
             rsi = calculate_rsi(closes, RSI_PERIOD)
             if rsi is None:
@@ -92,27 +111,56 @@ def main():
 
             if rsi <= RSI_OVERSOLD:
                 msg = (
-                    f"🟢 <b>{symbol}</b> - RSI(14) khung {INTERVAL}: <b>{rsi}</b>\n"
+                    f"🟢 <b>{symbol}</b> [{market_label}] - RSI(14) khung {INTERVAL}: <b>{rsi}</b>\n"
                     f"Vùng QUÁ BÁN (oversold)"
                 )
                 send_telegram_message(msg)
                 alerts_sent += 1
-                print(f"  -> {symbol} RSI={rsi} (oversold)")
+                print(f"  -> [{market_label}] {symbol} RSI={rsi} (oversold)")
             elif rsi >= RSI_OVERBOUGHT:
                 msg = (
-                    f"🔴 <b>{symbol}</b> - RSI(14) khung {INTERVAL}: <b>{rsi}</b>\n"
+                    f"🔴 <b>{symbol}</b> [{market_label}] - RSI(14) khung {INTERVAL}: <b>{rsi}</b>\n"
                     f"Vùng QUÁ MUA (overbought)"
                 )
                 send_telegram_message(msg)
                 alerts_sent += 1
-                print(f"  -> {symbol} RSI={rsi} (overbought)")
+                print(f"  -> [{market_label}] {symbol} RSI={rsi} (overbought)")
 
         except Exception as e:
-            print(f"Lỗi khi xử lý {symbol}: {e}")
+            print(f"Lỗi khi xử lý [{market_label}] {symbol}: {e}")
 
         time.sleep(REQUEST_DELAY)
 
-    print(f"Xong. Đã gửi {alerts_sent} cảnh báo.")
+    return alerts_sent
+
+
+def main():
+    print("Bắt đầu quét (1 lần)...")
+    total_alerts = 0
+
+    # --- Futures (USDT-M) - quét trước để biết coin nào đã có ở đây ---
+    futures_symbols = get_all_futures_usdt_symbols()
+    futures_set = set(futures_symbols)
+
+    if futures_symbols:
+        print(f"[Futures] Tổng số cặp USDT-M: {len(futures_symbols)}")
+        total_alerts += scan_market(
+            "FUTURES", BINANCE_FUTURES_BASE, "/fapi/v1/klines", futures_symbols
+        )
+    else:
+        print("[Futures] Bỏ qua (không lấy được dữ liệu, có thể bị chặn IP).")
+
+    # --- Spot - bỏ qua các cặp đã có bên Futures (ưu tiên Futures, tránh trùng) ---
+    spot_symbols_all = get_all_spot_usdt_symbols()
+    spot_symbols = [s for s in spot_symbols_all if s not in futures_set]
+    skipped = len(spot_symbols_all) - len(spot_symbols)
+    print(
+        f"[Spot] Tổng số cặp USDT: {len(spot_symbols_all)} "
+        f"(bỏ qua {skipped} cặp trùng với Futures, còn quét {len(spot_symbols)})"
+    )
+    total_alerts += scan_market("SPOT", BINANCE_SPOT_BASE, "/api/v3/klines", spot_symbols)
+
+    print(f"Xong. Đã gửi tổng cộng {total_alerts} cảnh báo.")
 
 
 if __name__ == "__main__":
