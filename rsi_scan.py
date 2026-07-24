@@ -20,6 +20,11 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 INTERVAL = "1h"
 RSI_OVERSOLD = 25
 RSI_OVERBOUGHT = 75
+
+INTERVAL_4H = "4h"
+RSI_OVERSOLD_4H = 30
+RSI_OVERBOUGHT_4H = 70
+
 RSI_PERIOD = 14
 QUOTE_ASSET = "USDT"
 REQUEST_DELAY = 0.25
@@ -102,32 +107,61 @@ def scan_market(market_label, base_url, klines_path, symbols):
     """Quét 1 danh sách symbol của 1 thị trường (Spot hoặc Futures), trả về số cảnh báo đã gửi."""
     alerts_sent = 0
     for symbol in symbols:
+        # --- Kiểm tra khung 1h ---
         try:
             klines = get_klines(base_url, klines_path, symbol, INTERVAL, limit=RSI_PERIOD * 3)
             closes = [float(k[4]) for k in klines]
             rsi = calculate_rsi(closes, RSI_PERIOD)
-            if rsi is None:
-                continue
 
-            if rsi <= RSI_OVERSOLD:
-                msg = (
-                    f"🟢 <b>{symbol}</b> [{market_label}] - RSI(14) khung {INTERVAL}: <b>{rsi}</b>\n"
-                    f"Vùng QUÁ BÁN (oversold)"
-                )
-                send_telegram_message(msg)
-                alerts_sent += 1
-                print(f"  -> [{market_label}] {symbol} RSI={rsi} (oversold)")
-            elif rsi >= RSI_OVERBOUGHT:
-                msg = (
-                    f"🔴 <b>{symbol}</b> [{market_label}] - RSI(14) khung {INTERVAL}: <b>{rsi}</b>\n"
-                    f"Vùng QUÁ MUA (overbought)"
-                )
-                send_telegram_message(msg)
-                alerts_sent += 1
-                print(f"  -> [{market_label}] {symbol} RSI={rsi} (overbought)")
+            if rsi is not None:
+                if rsi <= RSI_OVERSOLD:
+                    msg = (
+                        f"🟢 <b>{symbol}</b> [{market_label}] - RSI(14) khung {INTERVAL}: <b>{rsi}</b>\n"
+                        f"Vùng QUÁ BÁN (oversold)"
+                    )
+                    send_telegram_message(msg)
+                    alerts_sent += 1
+                    print(f"  -> [{market_label}] {symbol} RSI({INTERVAL})={rsi} (oversold)")
+                elif rsi >= RSI_OVERBOUGHT:
+                    msg = (
+                        f"🔴 <b>{symbol}</b> [{market_label}] - RSI(14) khung {INTERVAL}: <b>{rsi}</b>\n"
+                        f"Vùng QUÁ MUA (overbought)"
+                    )
+                    send_telegram_message(msg)
+                    alerts_sent += 1
+                    print(f"  -> [{market_label}] {symbol} RSI({INTERVAL})={rsi} (overbought)")
 
         except Exception as e:
-            print(f"Lỗi khi xử lý [{market_label}] {symbol}: {e}")
+            print(f"Lỗi khi xử lý [{market_label}] {symbol} khung {INTERVAL}: {e}")
+
+        time.sleep(REQUEST_DELAY)
+
+        # --- Kiểm tra khung 4h ---
+        try:
+            klines_4h = get_klines(base_url, klines_path, symbol, INTERVAL_4H, limit=RSI_PERIOD * 3)
+            closes_4h = [float(k[4]) for k in klines_4h]
+            rsi_4h = calculate_rsi(closes_4h, RSI_PERIOD)
+
+            if rsi_4h is not None:
+                if rsi_4h <= RSI_OVERSOLD_4H:
+                    msg = (
+                        f"🟢 <b>{symbol}</b> [{market_label}] - RSI(14) khung {INTERVAL_4H}: <b>{rsi_4h}</b>\n"
+                        f"Vùng QUÁ BÁN (oversold)"
+                    )
+                    send_telegram_message(msg)
+                    alerts_sent += 1
+                    print(f"  -> [{market_label}] {symbol} RSI({INTERVAL_4H})={rsi_4h} (oversold)")
+                elif rsi_4h >= RSI_OVERBOUGHT_4H:
+                    msg = (
+                        f"🔴 <b>{symbol}</b> [{market_label}] - RSI(14) khung {INTERVAL_4H}: <b>{rsi_4h}</b>\n"
+                        f"Vùng QUÁ MUA (overbought)"
+                    )
+                    send_telegram_message(msg)
+                    alerts_sent += 1
+                    print(f"  -> [{market_label}] {symbol} RSI({INTERVAL_4H})={rsi_4h} (overbought)")
+
+        except Exception as e:
+            print(f"Lỗi khi xử lý [{market_label}] {symbol} khung {INTERVAL_4H}: {e}")
 
         time.sleep(REQUEST_DELAY)
 
