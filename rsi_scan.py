@@ -107,21 +107,19 @@ def scan_market(market_label, base_url, klines_path, symbols):
     """Quét 1 danh sách symbol của 1 thị trường (Spot hoặc Futures), trả về số cảnh báo đã gửi."""
     alerts_sent = 0
     for symbol in symbols:
-        lines = []  # các dòng tín hiệu sẽ gộp chung vào 1 tin nhắn
+        rsi_1h = None
+        rsi_4h = None
+        triggered = False
 
         # --- Kiểm tra khung 1h ---
         try:
             klines = get_klines(base_url, klines_path, symbol, INTERVAL, limit=RSI_PERIOD * 3)
             closes = [float(k[4]) for k in klines]
-            rsi = calculate_rsi(closes, RSI_PERIOD)
+            rsi_1h = calculate_rsi(closes, RSI_PERIOD)
 
-            if rsi is not None:
-                if rsi <= RSI_OVERSOLD:
-                    lines.append(f"🟢 Khung {INTERVAL}: RSI={rsi} - QUÁ BÁN (oversold)")
-                    print(f"  -> [{market_label}] {symbol} RSI({INTERVAL})={rsi} (oversold)")
-                elif rsi >= RSI_OVERBOUGHT:
-                    lines.append(f"🔴 Khung {INTERVAL}: RSI={rsi} - QUÁ MUA (overbought)")
-                    print(f"  -> [{market_label}] {symbol} RSI({INTERVAL})={rsi} (overbought)")
+            if rsi_1h is not None and (rsi_1h <= RSI_OVERSOLD or rsi_1h >= RSI_OVERBOUGHT):
+                triggered = True
+                print(f"  -> [{market_label}] {symbol} RSI({INTERVAL})={rsi_1h}")
 
         except Exception as e:
             print(f"Lỗi khi xử lý [{market_label}] {symbol} khung {INTERVAL}: {e}")
@@ -134,22 +132,21 @@ def scan_market(market_label, base_url, klines_path, symbols):
             closes_4h = [float(k[4]) for k in klines_4h]
             rsi_4h = calculate_rsi(closes_4h, RSI_PERIOD)
 
-            if rsi_4h is not None:
-                if rsi_4h <= RSI_OVERSOLD_4H:
-                    lines.append(f"🟢 Khung {INTERVAL_4H}: RSI={rsi_4h} - QUÁ BÁN (oversold)")
-                    print(f"  -> [{market_label}] {symbol} RSI({INTERVAL_4H})={rsi_4h} (oversold)")
-                elif rsi_4h >= RSI_OVERBOUGHT_4H:
-                    lines.append(f"🔴 Khung {INTERVAL_4H}: RSI={rsi_4h} - QUÁ MUA (overbought)")
-                    print(f"  -> [{market_label}] {symbol} RSI({INTERVAL_4H})={rsi_4h} (overbought)")
+            if rsi_4h is not None and (rsi_4h <= RSI_OVERSOLD_4H or rsi_4h >= RSI_OVERBOUGHT_4H):
+                triggered = True
+                print(f"  -> [{market_label}] {symbol} RSI({INTERVAL_4H})={rsi_4h}")
 
         except Exception as e:
             print(f"Lỗi khi xử lý [{market_label}] {symbol} khung {INTERVAL_4H}: {e}")
 
         time.sleep(REQUEST_DELAY)
 
-        # --- Gửi GỘP 1 tin nhắn duy nhất nếu có ít nhất 1 khung báo tín hiệu ---
-        if lines:
-            msg = f"<b>{symbol}</b> [{market_label}]\n" + "\n".join(lines)
+        # --- Gửi GỘP thành 1 dòng gọn nếu ít nhất 1 khung có tín hiệu ---
+        if triggered and rsi_1h is not None and rsi_4h is not None:
+            msg = (
+                f"<b>{symbol}</b> [{market_label}] - "
+                f"RSI(1H): {rsi_1h}; RSI(4H): {rsi_4h}"
+            )
             send_telegram_message(msg)
             alerts_sent += 1
 
