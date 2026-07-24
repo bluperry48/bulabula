@@ -107,9 +107,8 @@ def scan_market(market_label, base_url, klines_path, symbols):
     """Quét 1 danh sách symbol của 1 thị trường (Spot hoặc Futures), trả về số cảnh báo đã gửi."""
     alerts_sent = 0
     for symbol in symbols:
-        rsi_1h = None
-        rsi_4h = None
-        triggered = False
+        triggered_1h = None  # None = không trigger, số = giá trị RSI đã trigger
+        triggered_4h = None
 
         # --- Kiểm tra khung 1h ---
         try:
@@ -118,7 +117,7 @@ def scan_market(market_label, base_url, klines_path, symbols):
             rsi_1h = calculate_rsi(closes, RSI_PERIOD)
 
             if rsi_1h is not None and (rsi_1h <= RSI_OVERSOLD or rsi_1h >= RSI_OVERBOUGHT):
-                triggered = True
+                triggered_1h = rsi_1h
                 print(f"  -> [{market_label}] {symbol} RSI({INTERVAL})={rsi_1h}")
 
         except Exception as e:
@@ -133,7 +132,7 @@ def scan_market(market_label, base_url, klines_path, symbols):
             rsi_4h = calculate_rsi(closes_4h, RSI_PERIOD)
 
             if rsi_4h is not None and (rsi_4h <= RSI_OVERSOLD_4H or rsi_4h >= RSI_OVERBOUGHT_4H):
-                triggered = True
+                triggered_4h = rsi_4h
                 print(f"  -> [{market_label}] {symbol} RSI({INTERVAL_4H})={rsi_4h}")
 
         except Exception as e:
@@ -141,12 +140,25 @@ def scan_market(market_label, base_url, klines_path, symbols):
 
         time.sleep(REQUEST_DELAY)
 
-        # --- Gửi GỘP thành 1 dòng gọn nếu ít nhất 1 khung có tín hiệu ---
-        if triggered and rsi_1h is not None and rsi_4h is not None:
-            msg = (
-                f"<b>{symbol}</b> [{market_label}] - "
-                f"RSI(1H): {rsi_1h}; RSI(4H): {rsi_4h}"
-            )
+        # --- Chỉ hiện khung nào THỰC SỰ trigger, khung chưa đạt ngưỡng thì bỏ qua ---
+        if triggered_1h is not None or triggered_4h is not None:
+            parts = []
+            emojis = []
+
+            if triggered_1h is not None:
+                parts.append(f"RSI(1H): {triggered_1h}")
+                emojis.append("🟢" if triggered_1h <= RSI_OVERSOLD else "🔴")
+            if triggered_4h is not None:
+                parts.append(f"RSI(4H): {triggered_4h}")
+                emojis.append("🟢" if triggered_4h <= RSI_OVERSOLD_4H else "🔴")
+
+            # Bỏ emoji trùng nhau (vd cả 2 khung cùng quá bán thì chỉ hiện 1 dấu 🟢)
+            unique_emojis = []
+            for e in emojis:
+                if e not in unique_emojis:
+                    unique_emojis.append(e)
+
+            msg = f"{''.join(unique_emojis)} <b>{symbol}</b> [{market_label}] - " + "; ".join(parts)
             send_telegram_message(msg)
             alerts_sent += 1
 
