@@ -29,6 +29,13 @@ RSI_PERIOD = 14
 QUOTE_ASSET = "USDT"
 REQUEST_DELAY = 0.25
 
+MACD_FAST = 19
+MACD_SLOW = 39
+
+# Số nến tải về mỗi lần - tăng lên để EMA26 (dùng cho MACD) đủ dữ liệu "khởi động"
+# cho ra kết quả chính xác, ổn định (RSI vẫn tính tốt với số nến này).
+HISTORY_LIMIT = 150
+
 
 def send_telegram_message(text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -103,56 +110,123 @@ def calculate_rsi(closes, period: int = 14):
     return round(100 - (100 / (1 + rs)), 2)
 
 
+def calculate_ema_series(values, period: int):
+    """Trả về list EMA, ema[0] tương ứng values[period-1] (điểm đầu tiên đủ dữ liệu)."""
+    if len(values) < period:
+        return []
+    ema = [sum(values[:period]) / period]  # SMA làm giá trị khởi tạo
+    multiplier = 2 / (period + 1)
+    for price in values[period:]:
+        ema.append((price - ema[-1]) * multiplier + ema[-1])
+    return ema
+
+
+def calculate_macd_line(closes, fast=MACD_FAST, slow=MACD_SLOW):
+    """
+    Trả về list giá trị đường MACD (EMA nhanh - EMA chậm), đã căn chỉnh đúng thời điểm.
+    macd_line[-1] = giá trị mới nhất, macd_line[-2] = giá trị của nến ngay trước đó.
+    """
+    ema_fast = calculate_ema_series(closes, fast)
+    ema_slow = calculate_ema_series(closes, slow)
+    if not ema_fast or not ema_slow:
+        return []
+
+    offset = slow - fast  # ema_fast đi trước ema_slow "offset" điểm dữ liệu
+    macd_line = []
+    for j in range(len(ema_slow)):
+        if j + offset >= len(ema_fast):
+            break
+        macd_line.append(ema_fast[j + offset] - ema_slow[j])
+    return macd_line
+
+
 def scan_market(market_label, base_url, klines_path, symbols):
     """Quét 1 danh sách symbol của 1 thị trường (Spot hoặc Futures), trả về số cảnh báo đã gửi."""
     alerts_sent = 0
     for symbol in symbols:
-        triggered_1h = None  # None = không trigger, số = giá trị RSI đã trigger
-        triggered_4h = None
+        triggered_rsi_1h = None  # None = không trigger, số = giá trị RSI đã trigger
+        triggered_rsi_4h = None
+        macd_cross_1h = None  # None = không trigger, "up"/"down" = hướng vừa cắt qua 0
+        macd_cross_4h = None
 
-        # --- Kiểm tra khung 1h ---
+        # --- Khung 1h: RSI + MACD (dùng chung 1 lần tải dữ liệu) ---
         try:
-            klines = get_klines(base_url, klines_path, symbol, INTERVAL, limit=RSI_PERIOD * 3)
+            klines = get_klines(base_url, klines_path, symbol, INTERVAL, limit=HISTORY_LIMIT)
             closes = [float(k[4]) for k in klines]
-            rsi_1h = calculate_rsi(closes, RSI_PERIOD)
 
+            rsi_1h = calculate_rsi(closes, RSI_PERIOD)
             if rsi_1h is not None and (rsi_1h <= RSI_OVERSOLD or rsi_1h >= RSI_OVERBOUGHT):
-                triggered_1h = rsi_1h
+                triggered_rsi_1h = rsi_1h
                 print(f"  -> [{market_label}] {symbol} RSI({INTERVAL})={rsi_1h}")
+
+            macd_line = calculate_macd_line(closes)
+            if len(macd_line) >= 2:
+                prev, curr = macd_line[-2], macd_line[-1]
+                if prev < 0 <= curr:
+                    macd_cross_1h = "up"
+                elif prev >= 0 > curr:
+                    macd_cross_1h = "down"
+                if macd_cross_1h:
+                    print(f"  -> [{market_label}] {symbol} MACD({INTERVAL}) cắt {macd_cross_1h} qua 0")
 
         except Exception as e:
             print(f"Lỗi khi xử lý [{market_label}] {symbol} khung {INTERVAL}: {e}")
 
         time.sleep(REQUEST_DELAY)
 
-        # --- Kiểm tra khung 4h ---
+        # --- Khung 4h: RSI + MACD ---
         try:
-            klines_4h = get_klines(base_url, klines_path, symbol, INTERVAL_4H, limit=RSI_PERIOD * 3)
+            klines_4h = get_klines(base_url, klines_path, symbol, INTERVAL_4H, limit=HISTORY_LIMIT)
             closes_4h = [float(k[4]) for k in klines_4h]
-            rsi_4h = calculate_rsi(closes_4h, RSI_PERIOD)
 
+            rsi_4h = calculate_rsi(closes_4h, RSI_PERIOD)
             if rsi_4h is not None and (rsi_4h <= RSI_OVERSOLD_4H or rsi_4h >= RSI_OVERBOUGHT_4H):
-                triggered_4h = rsi_4h
+                triggered_rsi_4h = rsi_4h
                 print(f"  -> [{market_label}] {symbol} RSI({INTERVAL_4H})={rsi_4h}")
+
+            macd_line_4h = calculate_macd_line(closes_4h)
+            if len(macd_line_4h) >= 2:
+                prev, curr = macd_line_4h[-2], macd_line_4h[-1]
+                if prev < 0 <= curr:
+                    macd_cross_4h = "up"
+                elif prev >= 0 > curr:
+                    macd_cross_4h = "down"
+                if macd_cross_4h:
+                    print(f"  -> [{market_label}] {symbol} MACD({INTERVAL_4H}) cắt {macd_cross_4h} qua 0")
 
         except Exception as e:
             print(f"Lỗi khi xử lý [{market_label}] {symbol} khung {INTERVAL_4H}: {e}")
 
         time.sleep(REQUEST_DELAY)
 
-        # --- Chỉ hiện khung nào THỰC SỰ trigger, khung chưa đạt ngưỡng thì bỏ qua ---
-        if triggered_1h is not None or triggered_4h is not None:
+        # --- Chỉ hiện tín hiệu nào THỰC SỰ trigger (RSI hoặc MACD), bỏ qua phần chưa đạt ---
+        has_signal = (
+            triggered_rsi_1h is not None
+            or triggered_rsi_4h is not None
+            or macd_cross_1h is not None
+            or macd_cross_4h is not None
+        )
+
+        if has_signal:
             parts = []
             emojis = []
 
-            if triggered_1h is not None:
-                parts.append(f"RSI(1H): {triggered_1h}")
-                emojis.append("🟢" if triggered_1h <= RSI_OVERSOLD else "🔴")
-            if triggered_4h is not None:
-                parts.append(f"RSI(4H): {triggered_4h}")
-                emojis.append("🟢" if triggered_4h <= RSI_OVERSOLD_4H else "🔴")
+            if triggered_rsi_1h is not None:
+                parts.append(f"RSI(1H): {triggered_rsi_1h}")
+                emojis.append("🟢" if triggered_rsi_1h <= RSI_OVERSOLD else "🔴")
+            if triggered_rsi_4h is not None:
+                parts.append(f"RSI(4H): {triggered_rsi_4h}")
+                emojis.append("🟢" if triggered_rsi_4h <= RSI_OVERSOLD_4H else "🔴")
+            if macd_cross_1h is not None:
+                label = "cắt lên 0" if macd_cross_1h == "up" else "cắt xuống 0"
+                parts.append(f"MACD(1H): {label}")
+                emojis.append("🟢" if macd_cross_1h == "up" else "🔴")
+            if macd_cross_4h is not None:
+                label = "cắt lên 0" if macd_cross_4h == "up" else "cắt xuống 0"
+                parts.append(f"MACD(4H): {label}")
+                emojis.append("🟢" if macd_cross_4h == "up" else "🔴")
 
-            # Bỏ emoji trùng nhau (vd cả 2 khung cùng quá bán thì chỉ hiện 1 dấu 🟢)
+            # Bỏ emoji trùng nhau (vd nhiều tín hiệu cùng chiều thì chỉ hiện 1 dấu)
             unique_emojis = []
             for e in emojis:
                 if e not in unique_emojis:
