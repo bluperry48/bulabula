@@ -18,8 +18,8 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 INTERVAL = "1h"
-RSI_OVERSOLD = 30
-RSI_OVERBOUGHT = 70
+RSI_OVERSOLD = 25
+RSI_OVERBOUGHT = 75
 
 INTERVAL_4H = "4h"
 RSI_OVERSOLD_4H = 30
@@ -29,8 +29,11 @@ RSI_PERIOD = 14
 QUOTE_ASSET = "USDT"
 REQUEST_DELAY = 0.25
 
-# Số nến tải về mỗi lần
-HISTORY_LIMIT = 150
+EMA_FAST = 50
+EMA_SLOW = 200
+
+# Số nến tải về mỗi lần - EMA200 cần rất nhiều dữ liệu lịch sử để tính chính xác
+HISTORY_LIMIT = 500
 
 
 def send_telegram_message(text: str):
@@ -106,14 +109,55 @@ def calculate_rsi(closes, period: int = 14):
     return round(100 - (100 / (1 + rs)), 2)
 
 
+def calculate_ema_series(values, period: int):
+    """Trả về list EMA, ema[0] tương ứng values[period-1] (điểm đầu tiên đủ dữ liệu)."""
+    if len(values) < period:
+        return []
+    ema = [sum(values[:period]) / period]  # SMA làm giá trị khởi tạo
+    multiplier = 2 / (period + 1)
+    for price in values[period:]:
+        ema.append((price - ema[-1]) * multiplier + ema[-1])
+    return ema
+
+
+def detect_ema_cross(closes, fast=EMA_FAST, slow=EMA_SLOW):
+    """
+    Trả về "up" nếu EMA nhanh vừa cắt LÊN EMA chậm (Golden Cross),
+    "down" nếu vừa cắt XUỐNG (Death Cross), None nếu không có tín hiệu.
+    """
+    ema_fast = calculate_ema_series(closes, fast)
+    ema_slow = calculate_ema_series(closes, slow)
+    if not ema_fast or not ema_slow:
+        return None
+
+    offset = slow - fast  # ema_fast đi trước ema_slow "offset" điểm dữ liệu
+    diff_series = []
+    for j in range(len(ema_slow)):
+        if j + offset >= len(ema_fast):
+            break
+        diff_series.append(ema_fast[j + offset] - ema_slow[j])
+
+    if len(diff_series) < 2:
+        return None
+
+    prev, curr = diff_series[-2], diff_series[-1]
+    if prev < 0 <= curr:
+        return "up"
+    elif prev >= 0 > curr:
+        return "down"
+    return None
+
+
 def scan_market(market_label, base_url, klines_path, symbols):
     """Quét 1 danh sách symbol của 1 thị trường (Spot hoặc Futures), trả về số cảnh báo đã gửi."""
     alerts_sent = 0
     for symbol in symbols:
         triggered_rsi_1h = None  # None = không trigger, số = giá trị RSI đã trigger
         triggered_rsi_4h = None
+        ema_cross_1h = None  # None = không trigger, "up"/"down" = hướng vừa cắt
+        ema_cross_4h = None
 
-        # --- Khung 1h: RSI ---
+        # --- Khung 1h: RSI + EMA50/200 (dùng chung 1 lần tải dữ liệu) ---
         try:
             klines = get_klines(base_url, klines_path, symbol, INTERVAL, limit=HISTORY_LIMIT)
             closes = [float(k[4]) for k in klines]
@@ -123,12 +167,16 @@ def scan_market(market_label, base_url, klines_path, symbols):
                 triggered_rsi_1h = rsi_1h
                 print(f"  -> [{market_label}] {symbol} RSI({INTERVAL})={rsi_1h}")
 
+            ema_cross_1h = detect_ema_cross(closes)
+            if ema_cross_1h:
+                print(f"  -> [{market_label}] {symbol} EMA50/200({INTERVAL}) cắt {ema_cross_1h}")
+
         except Exception as e:
             print(f"Lỗi khi xử lý [{market_label}] {symbol} khung {INTERVAL}: {e}")
 
         time.sleep(REQUEST_DELAY)
 
-        # --- Khung 4h: RSI ---
+        # --- Khung 4h: RSI + EMA50/200 ---
         try:
             klines_4h = get_klines(base_url, klines_path, symbol, INTERVAL_4H, limit=HISTORY_LIMIT)
             closes_4h = [float(k[4]) for k in klines_4h]
@@ -138,13 +186,24 @@ def scan_market(market_label, base_url, klines_path, symbols):
                 triggered_rsi_4h = rsi_4h
                 print(f"  -> [{market_label}] {symbol} RSI({INTERVAL_4H})={rsi_4h}")
 
+            ema_cross_4h = detect_ema_cross(closes_4h)
+            if ema_cross_4h:
+                print(f"  -> [{market_label}] {symbol} EMA50/200({INTERVAL_4H}) cắt {ema_cross_4h}")
+
         except Exception as e:
             print(f"Lỗi khi xử lý [{market_label}] {symbol} khung {INTERVAL_4H}: {e}")
 
         time.sleep(REQUEST_DELAY)
 
-        # --- Chỉ hiện khung nào THỰC SỰ trigger, khung chưa đạt ngưỡng thì bỏ qua ---
-        if triggered_rsi_1h is not None or triggered_rsi_4h is not None:
+        # --- Chỉ hiện tín hiệu nào THỰC SỰ trigger (RSI hoặc EMA cross), bỏ qua phần chưa đạt ---
+        has_signal = (
+            triggered_rsi_1h is not None
+            or triggered_rsi_4h is not None
+            or ema_cross_1h is not None
+            or ema_cross_4h is not None
+        )
+
+        if has_signal:
             parts = []
             emojis = []
 
@@ -154,8 +213,16 @@ def scan_market(market_label, base_url, klines_path, symbols):
             if triggered_rsi_4h is not None:
                 parts.append(f"RSI(4H): {triggered_rsi_4h}")
                 emojis.append("🟢" if triggered_rsi_4h <= RSI_OVERSOLD_4H else "🔴")
+            if ema_cross_1h is not None:
+                label = "EMA50 cắt lên EMA200 (Golden Cross)" if ema_cross_1h == "up" else "EMA50 cắt xuống EMA200 (Death Cross)"
+                parts.append(f"[1H] {label}")
+                emojis.append("🟢" if ema_cross_1h == "up" else "🔴")
+            if ema_cross_4h is not None:
+                label = "EMA50 cắt lên EMA200 (Golden Cross)" if ema_cross_4h == "up" else "EMA50 cắt xuống EMA200 (Death Cross)"
+                parts.append(f"[4H] {label}")
+                emojis.append("🟢" if ema_cross_4h == "up" else "🔴")
 
-            # Bỏ emoji trùng nhau (vd cả 2 khung cùng quá bán thì chỉ hiện 1 dấu)
+            # Bỏ emoji trùng nhau (vd nhiều tín hiệu cùng chiều thì chỉ hiện 1 dấu)
             unique_emojis = []
             for e in emojis:
                 if e not in unique_emojis:
