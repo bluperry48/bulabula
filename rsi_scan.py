@@ -25,6 +25,8 @@ INTERVAL_4H = "4h"
 RSI_OVERSOLD_4H = 30
 RSI_OVERBOUGHT_4H = 70
 
+INTERVAL_30M = "30m"
+
 RSI_PERIOD = 14
 QUOTE_ASSET = "USDT"
 REQUEST_DELAY = 0.25
@@ -156,6 +158,7 @@ def scan_market(market_label, base_url, klines_path, symbols):
         triggered_rsi_4h = None
         ema_cross_1h = None  # None = không trigger, "up"/"down" = hướng vừa cắt
         ema_cross_4h = None
+        ema_cross_30m = None
 
         # --- Khung 1h: RSI + EMA50/200 (dùng chung 1 lần tải dữ liệu) ---
         try:
@@ -195,12 +198,27 @@ def scan_market(market_label, base_url, klines_path, symbols):
 
         time.sleep(REQUEST_DELAY)
 
+        # --- Khung 30m: chỉ EMA50/200 (không cần RSI khung này) ---
+        try:
+            klines_30m = get_klines(base_url, klines_path, symbol, INTERVAL_30M, limit=HISTORY_LIMIT)
+            closes_30m = [float(k[4]) for k in klines_30m]
+
+            ema_cross_30m = detect_ema_cross(closes_30m)
+            if ema_cross_30m:
+                print(f"  -> [{market_label}] {symbol} EMA50/200({INTERVAL_30M}) cắt {ema_cross_30m}")
+
+        except Exception as e:
+            print(f"Lỗi khi xử lý [{market_label}] {symbol} khung {INTERVAL_30M}: {e}")
+
+        time.sleep(REQUEST_DELAY)
+
         # --- Chỉ hiện tín hiệu nào THỰC SỰ trigger (RSI hoặc EMA cross), bỏ qua phần chưa đạt ---
         has_signal = (
             triggered_rsi_1h is not None
             or triggered_rsi_4h is not None
             or ema_cross_1h is not None
             or ema_cross_4h is not None
+            or ema_cross_30m is not None
         )
 
         if has_signal:
@@ -213,6 +231,10 @@ def scan_market(market_label, base_url, klines_path, symbols):
             if triggered_rsi_4h is not None:
                 parts.append(f"RSI(4H): {triggered_rsi_4h}")
                 emojis.append("🟢" if triggered_rsi_4h <= RSI_OVERSOLD_4H else "🔴")
+            if ema_cross_30m is not None:
+                label = "EMA50 cắt lên EMA200 (Golden Cross)" if ema_cross_30m == "up" else "EMA50 cắt xuống EMA200 (Death Cross)"
+                parts.append(f"[30M] {label}")
+                emojis.append("🟢" if ema_cross_30m == "up" else "🔴")
             if ema_cross_1h is not None:
                 label = "EMA50 cắt lên EMA200 (Golden Cross)" if ema_cross_1h == "up" else "EMA50 cắt xuống EMA200 (Death Cross)"
                 parts.append(f"[1H] {label}")
