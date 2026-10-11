@@ -7,7 +7,9 @@ trực tiếp trong code để tránh lộ thông tin khi đẩy code lên GitHu
 """
 
 import os
+import json
 import time
+import collections
 import requests
 
 BINANCE_SPOT_BASE = "https://data-api.binance.vision"
@@ -37,6 +39,24 @@ EMA_SLOW = 200
 # Số nến tải về mỗi lần - EMA200 cần rất nhiều dữ liệu lịch sử để tính chính xác
 HISTORY_LIMIT = 500
 
+# --- Danh sách bStocks (token cổ phiếu hóa của Binance) cần LOẠI KHỎI việc quét ---
+# Chỉ ghi phần tên coin gốc (không cần đuôi USDT), code sẽ tự ghép thành XXXUSDT.
+# Lưu ý: Binance liên tục list thêm bStocks mới, nếu thấy cặp nào mới xuất hiện
+# trong Telegram thì chỉ cần thêm tên coin gốc của nó vào danh sách này.
+BSTOCK_BASES = {
+    # Đợt 6/2026
+    "CRCLB", "MUB", "NVDAB", "SNDKB", "TSLAB", "BNCB",
+    # Đợt 29/7/2026
+    "AAPLB", "AMATB", "AMZNB", "BEB", "DELLB", "FLNCB", "GSB", "PYPLB", "SMHB", "SOXSB",
+    # Đợt 30/9/2026
+    "ADBEB", "FWDIB", "HPEB", "PDDB", "SHAZB", "WENB", "ZMB",
+    # Đợt 7/10/2026
+    "JPMB", "LLYB", "SECZB", "USDEB",
+    # Bổ sung theo báo cáo thực tế từ Telegram
+    "MRNAB", "PLTRB",
+}
+EXCLUDED_SYMBOLS = {base + QUOTE_ASSET for base in BSTOCK_BASES}
+
 
 def send_telegram_message(text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -49,19 +69,103 @@ def send_telegram_message(text: str):
         print(f"[Telegram] Exception: {e}")
 
 
+# --- Tự động nhận diện bStocks MỚI (không cần sửa tay khi Binance list thêm) ---
+# Cách hoạt động: mỗi lần chạy, bot lấy danh sách bStocks đã biết (BSTOCK_BASES) làm "mẫu",
+# so sánh các thuộc tính quyền giao dịch của chúng với coin thường. Nếu tìm được thuộc
+# tính mà bStocks gần như đều giống nhau còn coin thường hầu như không có, bot dùng nó
+# (kết hợp điều kiện tên kết thúc bằng chữ B) để loại luôn các bStocks mới chưa có trong danh sách.
+SIGNATURE_FIELDS = [
+    "permissionSets", "permissions", "isMarginTradingAllowed", "icebergAllowed",
+    "ocoAllowed", "otoAllowed", "allowTrailingStop", "cancelReplaceAllowed",
+    "quoteOrderQtyMarketAllowed", "orderTypes", "defaultSelfTradePreventionMode",
+    "allowedSelfTradePreventionModes",
+]
+AUTO_MIN_SAMPLE = 5          # cần ít nhất 5 bStocks mẫu có mặt trên sàn mới tự học
+AUTO_MIN_KNOWN_SHARE = 0.9   # >= 90% bStocks mẫu phải có cùng giá trị thuộc tính
+AUTO_MAX_OTHER_SHARE = 0.02  # <= 2% coin thường được phép có cùng giá trị đó
+AUTO_MAX_EXCLUDE = 80        # chốt an toàn: nếu tự phát hiện quá 80 cặp thì bỏ qua (nghi nhận diện sai)
+
+
+def _field_value(symbol_info, field):
+    value = symbol_info.get(field)
+    if field in ("orderTypes", "allowedSelfTradePreventionModes") and isinstance(value, list):
+        value = sorted(value)
+    return json.dumps(value, sort_keys=True)
+
+
+def detect_new_bstocks(usdt_symbols):
+    """Trả về set các symbol bStocks MỚI (chưa có trong danh sách tay) được tự phát hiện."""
+    known = [s for s in usdt_symbols if s["baseAsset"] in BSTOCK_BASES]
+    others = [s for s in usdt_symbols if s["baseAsset"] not in BSTOCK_BASES]
+
+    if len(known) < AUTO_MIN_SAMPLE or len(others) < 50:
+        print("[bStocks] Không đủ mẫu để tự học dấu hiệu nhận biết, chỉ dùng danh sách tay.")
+        return set()
+
+    rules = {}
+    for field in SIGNATURE_FIELDS:
+        counts = collections.Counter(_field_value(s, field) for s in known)
+        value, n = counts.most_common(1)[0]
+        if n / len(known) < AUTO_MIN_KNOWN_SHARE:
+            continue
+        share_others = sum(1 for s in others if _field_value(s, field) == value) / len(others)
+        if share_others <= AUTO_MAX_OTHER_SHARE:
+            rules[field] = value
+
+    if not rules:
+        print("[bStocks] Không tìm thấy dấu hiệu đặc trưng của bStocks, chỉ dùng danh sách tay.")
+        return set()
+
+    print(f"[bStocks] Dấu hiệu nhận biết tự học được: {rules}")
+
+    detected = set()
+    for s in others:
+        if not s["baseAsset"].endswith("B"):
+            continue  # bStocks luôn có tên kết thúc bằng B -> thêm lớp bảo vệ chống loại nhầm
+        if all(_field_value(s, f) == v for f, v in rules.items()):
+            detected.add(s["symbol"])
+
+    if len(detected) > AUTO_MAX_EXCLUDE:
+        print(f"[bStocks] Tự phát hiện {len(detected)} cặp (quá nhiều, nghi nhận diện sai) -> bỏ qua.")
+        return set()
+
+    return detected
+
+
 def get_all_spot_usdt_symbols():
+    """
+    Lấy danh sách cặp Spot USDT đang giao dịch, TỰ CẬP NHẬT mỗi lần chạy:
+    cặp mới list sẽ được quét, cặp bị hủy niêm yết (không còn TRADING) tự biến mất.
+    Đồng thời loại bỏ bStocks (danh sách tay + tự phát hiện).
+    """
     url = f"{BINANCE_SPOT_BASE}/api/v3/exchangeInfo"
     r = requests.get(url, timeout=15)
     r.raise_for_status()
     data = r.json()
-    symbols = []
-    for s in data["symbols"]:
-        if (
-            s["quoteAsset"] == QUOTE_ASSET
-            and s["status"] == "TRADING"
-            and s["isSpotTradingAllowed"]
-        ):
-            symbols.append(s["symbol"])
+
+    usdt_symbols = [
+        s for s in data["symbols"]
+        if s["quoteAsset"] == QUOTE_ASSET
+        and s["status"] == "TRADING"
+        and s.get("isSpotTradingAllowed", True)
+    ]
+
+    auto_detected = detect_new_bstocks(usdt_symbols)
+    if auto_detected:
+        print(f"[bStocks] Tự phát hiện thêm {len(auto_detected)} cặp bStocks mới: {sorted(auto_detected)}")
+
+    excluded = EXCLUDED_SYMBOLS | auto_detected
+    symbols = [s["symbol"] for s in usdt_symbols if s["symbol"] not in excluded]
+
+    # Gợi ý để bạn kiểm tra: coin tên kết thúc bằng B nhưng vẫn chưa bị loại
+    # (thường chỉ là coin thật như BNB; nếu thấy bStocks mới lọt vào đây thì thêm vào BSTOCK_BASES)
+    suspects = sorted(
+        s["baseAsset"] for s in usdt_symbols
+        if s["baseAsset"].endswith("B") and s["symbol"] not in excluded
+    )
+    if suspects:
+        print(f"[bStocks] Coin tên kết thúc bằng B chưa bị loại (kiểm tra thủ công nếu cần): {suspects}")
+
     return sorted(symbols)
 
 
