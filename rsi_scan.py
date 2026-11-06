@@ -7,9 +7,7 @@ trực tiếp trong code để tránh lộ thông tin khi đẩy code lên GitHu
 """
 
 import os
-import json
 import time
-import collections
 import requests
 
 BINANCE_SPOT_BASE = "https://data-api.binance.vision"
@@ -33,29 +31,24 @@ RSI_PERIOD = 14
 QUOTE_ASSET = "USDT"
 REQUEST_DELAY = 0.25
 
-EMA_FAST = 50
-EMA_SLOW = 200
+# Số nến tải về mỗi lần (đủ để RSI tính ổn định)
+HISTORY_LIMIT = 200
 
-# Số nến tải về mỗi lần - EMA200 cần rất nhiều dữ liệu lịch sử để tính chính xác
-HISTORY_LIMIT = 500
+# --- Luật lọc: LOẠI mọi cặp có chữ B ngay trước USDT (bStocks như NVDABUSDT, SOXLBUSDT, STXBUSDT...) ---
+# Vì luật này cũng trúng cả coin thật có tên kết thúc bằng B, những coin đó cần giữ lại
+# thì ghi vào KEEP_SYMBOLS (hiện giữ BNBUSDT).
+EXCLUDE_B_SUFFIX = "B" + QUOTE_ASSET
+KEEP_SYMBOLS = {"BNBUSDT"}
 
-# --- Danh sách bStocks (token cổ phiếu hóa của Binance) cần LOẠI KHỎI việc quét ---
-# Chỉ ghi phần tên coin gốc (không cần đuôi USDT), code sẽ tự ghép thành XXXUSDT.
-# Lưu ý: Binance liên tục list thêm bStocks mới, nếu thấy cặp nào mới xuất hiện
-# trong Telegram thì chỉ cần thêm tên coin gốc của nó vào danh sách này.
-BSTOCK_BASES = {
-    # Đợt 6/2026
-    "CRCLB", "MUB", "NVDAB", "SNDKB", "TSLAB", "BNCB",
-    # Đợt 29/7/2026
-    "AAPLB", "AMATB", "AMZNB", "BEB", "DELLB", "FLNCB", "GSB", "PYPLB", "SMHB", "SOXSB",
-    # Đợt 30/9/2026
-    "ADBEB", "FWDIB", "HPEB", "PDDB", "SHAZB", "WENB", "ZMB",
-    # Đợt 7/10/2026
-    "JPMB", "LLYB", "SECZB", "USDEB",
-    # Bổ sung theo báo cáo thực tế từ Telegram
-    "MRNAB", "PLTRB",
-}
-EXCLUDED_SYMBOLS = {base + QUOTE_ASSET for base in BSTOCK_BASES}
+# --- Cắt qua mốc 50 của RSI (khung 30m và 1h, tính trên nến ĐÃ ĐÓNG) ---
+RSI_MIDLINE = 50
+# Chỉ báo nếu nến vừa đóng cách hiện tại không quá số phút này (tránh báo lặp ở các lượt quét sau).
+# Nên nhỏ hơn 30 (độ dài nến 30m) và lớn hơn thời gian 1 lượt quét.
+FRESH_WINDOW_MINUTES = 25
+
+
+def is_excluded_symbol(symbol: str) -> bool:
+    return symbol.endswith(EXCLUDE_B_SUFFIX) and symbol not in KEEP_SYMBOLS
 
 
 def send_telegram_message(text: str):
@@ -69,103 +62,27 @@ def send_telegram_message(text: str):
         print(f"[Telegram] Exception: {e}")
 
 
-# --- Tự động nhận diện bStocks MỚI (không cần sửa tay khi Binance list thêm) ---
-# Cách hoạt động: mỗi lần chạy, bot lấy danh sách bStocks đã biết (BSTOCK_BASES) làm "mẫu",
-# so sánh các thuộc tính quyền giao dịch của chúng với coin thường. Nếu tìm được thuộc
-# tính mà bStocks gần như đều giống nhau còn coin thường hầu như không có, bot dùng nó
-# (kết hợp điều kiện tên kết thúc bằng chữ B) để loại luôn các bStocks mới chưa có trong danh sách.
-SIGNATURE_FIELDS = [
-    "permissionSets", "permissions", "isMarginTradingAllowed", "icebergAllowed",
-    "ocoAllowed", "otoAllowed", "allowTrailingStop", "cancelReplaceAllowed",
-    "quoteOrderQtyMarketAllowed", "orderTypes", "defaultSelfTradePreventionMode",
-    "allowedSelfTradePreventionModes",
-]
-AUTO_MIN_SAMPLE = 5          # cần ít nhất 5 bStocks mẫu có mặt trên sàn mới tự học
-AUTO_MIN_KNOWN_SHARE = 0.9   # >= 90% bStocks mẫu phải có cùng giá trị thuộc tính
-AUTO_MAX_OTHER_SHARE = 0.02  # <= 2% coin thường được phép có cùng giá trị đó
-AUTO_MAX_EXCLUDE = 80        # chốt an toàn: nếu tự phát hiện quá 80 cặp thì bỏ qua (nghi nhận diện sai)
-
-
-def _field_value(symbol_info, field):
-    value = symbol_info.get(field)
-    if field in ("orderTypes", "allowedSelfTradePreventionModes") and isinstance(value, list):
-        value = sorted(value)
-    return json.dumps(value, sort_keys=True)
-
-
-def detect_new_bstocks(usdt_symbols):
-    """Trả về set các symbol bStocks MỚI (chưa có trong danh sách tay) được tự phát hiện."""
-    known = [s for s in usdt_symbols if s["baseAsset"] in BSTOCK_BASES]
-    others = [s for s in usdt_symbols if s["baseAsset"] not in BSTOCK_BASES]
-
-    if len(known) < AUTO_MIN_SAMPLE or len(others) < 50:
-        print("[bStocks] Không đủ mẫu để tự học dấu hiệu nhận biết, chỉ dùng danh sách tay.")
-        return set()
-
-    rules = {}
-    for field in SIGNATURE_FIELDS:
-        counts = collections.Counter(_field_value(s, field) for s in known)
-        value, n = counts.most_common(1)[0]
-        if n / len(known) < AUTO_MIN_KNOWN_SHARE:
-            continue
-        share_others = sum(1 for s in others if _field_value(s, field) == value) / len(others)
-        if share_others <= AUTO_MAX_OTHER_SHARE:
-            rules[field] = value
-
-    if not rules:
-        print("[bStocks] Không tìm thấy dấu hiệu đặc trưng của bStocks, chỉ dùng danh sách tay.")
-        return set()
-
-    print(f"[bStocks] Dấu hiệu nhận biết tự học được: {rules}")
-
-    detected = set()
-    for s in others:
-        if not s["baseAsset"].endswith("B"):
-            continue  # bStocks luôn có tên kết thúc bằng B -> thêm lớp bảo vệ chống loại nhầm
-        if all(_field_value(s, f) == v for f, v in rules.items()):
-            detected.add(s["symbol"])
-
-    if len(detected) > AUTO_MAX_EXCLUDE:
-        print(f"[bStocks] Tự phát hiện {len(detected)} cặp (quá nhiều, nghi nhận diện sai) -> bỏ qua.")
-        return set()
-
-    return detected
-
-
 def get_all_spot_usdt_symbols():
     """
     Lấy danh sách cặp Spot USDT đang giao dịch, TỰ CẬP NHẬT mỗi lần chạy:
     cặp mới list sẽ được quét, cặp bị hủy niêm yết (không còn TRADING) tự biến mất.
-    Đồng thời loại bỏ bStocks (danh sách tay + tự phát hiện).
+    Đồng thời loại các cặp có chữ B trước USDT.
     """
     url = f"{BINANCE_SPOT_BASE}/api/v3/exchangeInfo"
     r = requests.get(url, timeout=15)
     r.raise_for_status()
     data = r.json()
 
-    usdt_symbols = [
-        s for s in data["symbols"]
+    all_symbols = [
+        s["symbol"] for s in data["symbols"]
         if s["quoteAsset"] == QUOTE_ASSET
         and s["status"] == "TRADING"
         and s.get("isSpotTradingAllowed", True)
     ]
+    excluded = sorted(s for s in all_symbols if is_excluded_symbol(s))
+    symbols = [s for s in all_symbols if not is_excluded_symbol(s)]
 
-    auto_detected = detect_new_bstocks(usdt_symbols)
-    if auto_detected:
-        print(f"[bStocks] Tự phát hiện thêm {len(auto_detected)} cặp bStocks mới: {sorted(auto_detected)}")
-
-    excluded = EXCLUDED_SYMBOLS | auto_detected
-    symbols = [s["symbol"] for s in usdt_symbols if s["symbol"] not in excluded]
-
-    # Gợi ý để bạn kiểm tra: coin tên kết thúc bằng B nhưng vẫn chưa bị loại
-    # (thường chỉ là coin thật như BNB; nếu thấy bStocks mới lọt vào đây thì thêm vào BSTOCK_BASES)
-    suspects = sorted(
-        s["baseAsset"] for s in usdt_symbols
-        if s["baseAsset"].endswith("B") and s["symbol"] not in excluded
-    )
-    if suspects:
-        print(f"[bStocks] Coin tên kết thúc bằng B chưa bị loại (kiểm tra thủ công nếu cần): {suspects}")
-
+    print(f"[Lọc] Loại {len(excluded)} cặp có chữ B trước {QUOTE_ASSET}: {excluded}")
     return sorted(symbols)
 
 
@@ -182,6 +99,7 @@ def get_all_futures_usdt_symbols():
                 s["quoteAsset"] == QUOTE_ASSET
                 and s["status"] == "TRADING"
                 and s["contractType"] == "PERPETUAL"
+                and not is_excluded_symbol(s["symbol"])
             ):
                 symbols.append(s["symbol"])
         return sorted(symbols)
@@ -215,43 +133,54 @@ def calculate_rsi(closes, period: int = 14):
     return round(100 - (100 / (1 + rs)), 2)
 
 
-def calculate_ema_series(values, period: int):
-    """Trả về list EMA, ema[0] tương ứng values[period-1] (điểm đầu tiên đủ dữ liệu)."""
-    if len(values) < period:
+def calculate_rsi_series(closes, period: int = 14):
+    """RSI (Wilder) cho từng nến, giá trị cuối = RSI nến mới nhất, kế cuối = RSI nến ngay trước đó."""
+    if len(closes) < period + 1:
         return []
-    ema = [sum(values[:period]) / period]  # SMA làm giá trị khởi tạo
-    multiplier = 2 / (period + 1)
-    for price in values[period:]:
-        ema.append((price - ema[-1]) * multiplier + ema[-1])
-    return ema
+    deltas = [closes[i + 1] - closes[i] for i in range(len(closes) - 1)]
+    gains = [d if d > 0 else 0 for d in deltas]
+    losses = [-d if d < 0 else 0 for d in deltas]
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    def to_rsi(ag, al):
+        return 100.0 if al == 0 else 100 - (100 / (1 + ag / al))
+
+    series = [to_rsi(avg_gain, avg_loss)]
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        series.append(to_rsi(avg_gain, avg_loss))
+    return series
 
 
-def detect_ema_cross(closes, fast=EMA_FAST, slow=EMA_SLOW):
+def detect_rsi_midline_cross(closes, period: int = 14, level: float = RSI_MIDLINE):
     """
-    Trả về "up" nếu EMA nhanh vừa cắt LÊN EMA chậm (Golden Cross),
-    "down" nếu vừa cắt XUỐNG (Death Cross), None nếu không có tín hiệu.
+    So RSI của 2 nến đã đóng gần nhất. Trả về ("up", rsi_trước, rsi_sau) nếu vừa vượt LÊN trên mức,
+    ("down", rsi_trước, rsi_sau) nếu vừa tụt XUỐNG dưới mức, None nếu không có cắt.
     """
-    ema_fast = calculate_ema_series(closes, fast)
-    ema_slow = calculate_ema_series(closes, slow)
-    if not ema_fast or not ema_slow:
+    series = calculate_rsi_series(closes, period)
+    if len(series) < 2:
         return None
-
-    offset = slow - fast  # ema_fast đi trước ema_slow "offset" điểm dữ liệu
-    diff_series = []
-    for j in range(len(ema_slow)):
-        if j + offset >= len(ema_fast):
-            break
-        diff_series.append(ema_fast[j + offset] - ema_slow[j])
-
-    if len(diff_series) < 2:
-        return None
-
-    prev, curr = diff_series[-2], diff_series[-1]
-    if prev < 0 <= curr:
-        return "up"
-    elif prev >= 0 > curr:
-        return "down"
+    prev, curr = series[-2], series[-1]
+    if prev < level <= curr:
+        return ("up", prev, curr)
+    if prev >= level > curr:
+        return ("down", prev, curr)
     return None
+
+
+def closed_closes_with_age(klines):
+    """
+    Bỏ cây nến đang chạy dở (chưa đóng). Trả về (list giá đóng cửa các nến ĐÃ ĐÓNG,
+    số phút kể từ lúc nến đóng gần nhất đóng cửa).
+    """
+    now_ms = time.time() * 1000
+    closed = [k for k in klines if k[6] < now_ms]  # k[6] = thời điểm đóng nến (ms)
+    if not closed:
+        return [], None
+    age_minutes = (now_ms - closed[-1][6]) / 60000
+    return [float(k[4]) for k in closed], age_minutes
 
 
 def scan_market(market_label, base_url, klines_path, symbols):
@@ -260,11 +189,10 @@ def scan_market(market_label, base_url, klines_path, symbols):
     for symbol in symbols:
         triggered_rsi_1h = None  # None = không trigger, số = giá trị RSI đã trigger
         triggered_rsi_4h = None
-        ema_cross_1h = None  # None = không trigger, "up"/"down" = hướng vừa cắt
-        ema_cross_4h = None
-        ema_cross_30m = None
+        rsi_cross_30m = None  # None hoặc ("up"/"down", rsi_trước, rsi_sau)
+        rsi_cross_1h = None
 
-        # --- Khung 1h: RSI + EMA50/200 (dùng chung 1 lần tải dữ liệu) ---
+        # --- Khung 1h: RSI quá mua/quá bán + RSI cắt mốc 50 (dùng chung 1 lần tải dữ liệu) ---
         try:
             klines = get_klines(base_url, klines_path, symbol, INTERVAL, limit=HISTORY_LIMIT)
             closes = [float(k[4]) for k in klines]
@@ -274,16 +202,19 @@ def scan_market(market_label, base_url, klines_path, symbols):
                 triggered_rsi_1h = rsi_1h
                 print(f"  -> [{market_label}] {symbol} RSI({INTERVAL})={rsi_1h}")
 
-            ema_cross_1h = detect_ema_cross(closes)
-            if ema_cross_1h:
-                print(f"  -> [{market_label}] {symbol} EMA50/200({INTERVAL}) cắt {ema_cross_1h}")
+            # RSI cắt mốc 50 trên nến 1h vừa đóng
+            closed_closes_1h, age_1h = closed_closes_with_age(klines)
+            if age_1h is not None and age_1h <= FRESH_WINDOW_MINUTES:
+                rsi_cross_1h = detect_rsi_midline_cross(closed_closes_1h, RSI_PERIOD)
+                if rsi_cross_1h:
+                    print(f"  -> [{market_label}] {symbol} RSI(1H) cắt {rsi_cross_1h[0]} mốc {RSI_MIDLINE}")
 
         except Exception as e:
             print(f"Lỗi khi xử lý [{market_label}] {symbol} khung {INTERVAL}: {e}")
 
         time.sleep(REQUEST_DELAY)
 
-        # --- Khung 4h: RSI + EMA50/200 ---
+        # --- Khung 4h: RSI quá mua/quá bán ---
         try:
             klines_4h = get_klines(base_url, klines_path, symbol, INTERVAL_4H, limit=HISTORY_LIMIT)
             closes_4h = [float(k[4]) for k in klines_4h]
@@ -293,36 +224,33 @@ def scan_market(market_label, base_url, klines_path, symbols):
                 triggered_rsi_4h = rsi_4h
                 print(f"  -> [{market_label}] {symbol} RSI({INTERVAL_4H})={rsi_4h}")
 
-            ema_cross_4h = detect_ema_cross(closes_4h)
-            if ema_cross_4h:
-                print(f"  -> [{market_label}] {symbol} EMA50/200({INTERVAL_4H}) cắt {ema_cross_4h}")
-
         except Exception as e:
             print(f"Lỗi khi xử lý [{market_label}] {symbol} khung {INTERVAL_4H}: {e}")
 
         time.sleep(REQUEST_DELAY)
 
-        # --- Khung 30m: chỉ EMA50/200 (không cần RSI khung này) ---
+        # --- Khung 30m: chỉ RSI cắt mốc 50 (không báo RSI quá mua/quá bán ở khung này) ---
         try:
             klines_30m = get_klines(base_url, klines_path, symbol, INTERVAL_30M, limit=HISTORY_LIMIT)
-            closes_30m = [float(k[4]) for k in klines_30m]
 
-            ema_cross_30m = detect_ema_cross(closes_30m)
-            if ema_cross_30m:
-                print(f"  -> [{market_label}] {symbol} EMA50/200({INTERVAL_30M}) cắt {ema_cross_30m}")
+            # RSI cắt mốc 50 trên nến 30m vừa đóng
+            closed_closes_30m, age_30m = closed_closes_with_age(klines_30m)
+            if age_30m is not None and age_30m <= FRESH_WINDOW_MINUTES:
+                rsi_cross_30m = detect_rsi_midline_cross(closed_closes_30m, RSI_PERIOD)
+                if rsi_cross_30m:
+                    print(f"  -> [{market_label}] {symbol} RSI(30M) cắt {rsi_cross_30m[0]} mốc {RSI_MIDLINE}")
 
         except Exception as e:
             print(f"Lỗi khi xử lý [{market_label}] {symbol} khung {INTERVAL_30M}: {e}")
 
         time.sleep(REQUEST_DELAY)
 
-        # --- Chỉ hiện tín hiệu nào THỰC SỰ trigger (RSI hoặc EMA cross), bỏ qua phần chưa đạt ---
+        # --- Chỉ hiện tín hiệu nào THỰC SỰ trigger, bỏ qua phần chưa đạt ---
         has_signal = (
             triggered_rsi_1h is not None
             or triggered_rsi_4h is not None
-            or ema_cross_1h is not None
-            or ema_cross_4h is not None
-            or ema_cross_30m is not None
+            or rsi_cross_30m is not None
+            or rsi_cross_1h is not None
         )
 
         if has_signal:
@@ -335,18 +263,16 @@ def scan_market(market_label, base_url, klines_path, symbols):
             if triggered_rsi_4h is not None:
                 parts.append(f"RSI(4H): {triggered_rsi_4h}")
                 emojis.append("🟢" if triggered_rsi_4h <= RSI_OVERSOLD_4H else "🔴")
-            if ema_cross_30m is not None:
-                label = "EMA50 cắt lên EMA200 (Golden Cross)" if ema_cross_30m == "up" else "EMA50 cắt xuống EMA200 (Death Cross)"
-                parts.append(f"[30M] {label}")
-                emojis.append("🟢" if ema_cross_30m == "up" else "🔴")
-            if ema_cross_1h is not None:
-                label = "EMA50 cắt lên EMA200 (Golden Cross)" if ema_cross_1h == "up" else "EMA50 cắt xuống EMA200 (Death Cross)"
-                parts.append(f"[1H] {label}")
-                emojis.append("🟢" if ema_cross_1h == "up" else "🔴")
-            if ema_cross_4h is not None:
-                label = "EMA50 cắt lên EMA200 (Golden Cross)" if ema_cross_4h == "up" else "EMA50 cắt xuống EMA200 (Death Cross)"
-                parts.append(f"[4H] {label}")
-                emojis.append("🟢" if ema_cross_4h == "up" else "🔴")
+            if rsi_cross_30m is not None:
+                direction, prev_rsi, curr_rsi = rsi_cross_30m
+                word = "cắt lên" if direction == "up" else "cắt xuống"
+                parts.append(f"RSI(30M) {word} {RSI_MIDLINE}: {prev_rsi:.1f} ➜ {curr_rsi:.1f}")
+                emojis.append("🟢" if direction == "up" else "🔴")
+            if rsi_cross_1h is not None:
+                direction, prev_rsi, curr_rsi = rsi_cross_1h
+                word = "cắt lên" if direction == "up" else "cắt xuống"
+                parts.append(f"RSI(1H) {word} {RSI_MIDLINE}: {prev_rsi:.1f} ➜ {curr_rsi:.1f}")
+                emojis.append("🟢" if direction == "up" else "🔴")
 
             # Bỏ emoji trùng nhau (vd nhiều tín hiệu cùng chiều thì chỉ hiện 1 dấu)
             unique_emojis = []
