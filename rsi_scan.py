@@ -2,32 +2,18 @@ import os
 import time
 import requests
 import asyncio
-BINANCE_SPOT_BASE = "https://data-api.binance.vision"
+
 BINANCE_FUTURES_BASE = "https://fapi.binance.com"
 
-# Đọc từ GitHub Secrets
+# Đọc từ GitHub Secrets (không lưu trực tiếp)
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-INTERVAL = "1h"
+RSI_PERIOD = 14
 RSI_OVERSOLD = 25
 RSI_OVERBOUGHT = 75
-INTERVAL_4H = "4h"
-RSI_OVERSOLD_4H = 30
-RSI_OVERBOUGHT_4H = 70
-INTERVAL_30M = "30m"
-RSI_PERIOD = 14
-QUOTE_ASSET = "USDT"
 REQUEST_DELAY = 0.25
-HISTORY_LIMIT = 200
 FRESH_WINDOW_MINUTES = 25
-
-# --- Lọc cũ (không đụng) ---
-EXCLUDE_B_SUFFIX = "B" + QUOTE_ASSET
-KEEP_SYMBOLS = {"BNBUSDT"}
-
-def is_excluded_symbol(symbol: str) -> bool:
-    return symbol.endswith(EXCLUDE_B_SUFFIX) and symbol not in KEEP_SYMBOLS
 
 def send_telegram_message(text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -39,24 +25,12 @@ def send_telegram_message(text: str):
     except Exception as e:
         print(f"[Telegram] Exception: {e}")
 
-# ================== LẤY SYMBOLS CŨ (không đụng) ==================
-def get_all_spot_usdt_symbols():
-    url = f"{BINANCE_SPOT_BASE}/api/v3/exchangeInfo"
-    r = requests.get(url, timeout=15)
-    r.raise_for_status()
-    data = r.json()
-    all_symbols = [
-        s["symbol"] for s in data["symbols"]
-        if s["quoteAsset"] == QUOTE_ASSET
-        and s["status"] == "TRADING"
-        and s.get("isSpotTradingAllowed", True)
-    ]
-    excluded = sorted(s for s in all_symbols if is_excluded_symbol(s))
-    symbols = [s for s in all_symbols if not is_excluded_symbol(s)]
-    print(f"[Lọc] Loại {len(excluded)} cặp có chữ B trước {QUOTE_ASSET}: {excluded}")
-    return sorted(symbols)
+def is_excluded_symbol(symbol: str) -> bool:
+    """Không đụng (vẫn giữ để tương lai mở rộng)"""
+    return False  # Dễ dàng bật lại nếu cần
 
 def get_all_futures_usdt_symbols():
+    """Lấy danh sách cặp Futures USDT-M"""
     url = f"{BINANCE_FUTURES_BASE}/fapi/v1/exchangeInfo"
     try:
         r = requests.get(url, timeout=15)
@@ -65,7 +39,7 @@ def get_all_futures_usdt_symbols():
         symbols = []
         for s in data["symbols"]:
             if (
-                s["quoteAsset"] == QUOTE_ASSET
+                s["quoteAsset"] == "USDT"
                 and s["status"] == "TRADING"
                 and s["contractType"] == "PERPETUAL"
                 and not is_excluded_symbol(s["symbol"])
@@ -83,7 +57,7 @@ def get_klines(base_url: str, path: str, symbol: str, interval: str, limit: int 
     r.raise_for_status()
     return r.json()
 
-# ================== RSI 14 (Wilder) ==================
+# ================== RSI 14 (Wilder) - CHỈ RSI ==================
 def calculate_rsi(closes, period: int = 14):
     if len(closes) < period + 1:
         return None
@@ -100,24 +74,7 @@ def calculate_rsi(closes, period: int = 14):
     rs = avg_gain / avg_loss
     return round(100 - (100 / (1 + rs)), 2)
 
-def calculate_rsi_series(closes, period: int = 14):
-    if len(closes) < period + 1:
-        return []
-    deltas = [closes[i + 1] - closes[i] for i in range(len(closes) - 1)]
-    gains = [d if d > 0 else 0 for d in deltas]
-    losses = [-d if d < 0 else 0 for d in deltas]
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-    def to_rsi(ag, al):
-        return 100.0 if al == 0 else 100 - (100 / (1 + ag / al))
-    series = [to_rsi(avg_gain, avg_loss)]
-    for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-        series.append(to_rsi(avg_gain, avg_loss))
-    return series
-
-# ================== RSI 14 REAL-TIME (CHỈ CÓ CÁI NÀY MỚI) ==================
+# ================== RSI 14 REAL-TIME ==================
 async def scan_rsi_realtime():
     print("🔄 Bắt đầu quét RSI 14 realtime Futures USDT...")
     futures_symbols = get_all_futures_usdt_symbols()
@@ -136,9 +93,9 @@ async def scan_rsi_realtime():
             rsi_value = calculate_rsi(closes, RSI_PERIOD)
 
             if rsi_value is not None:
-                if rsi_value <= 25:          # RSI_OVERSOLD cũ
+                if rsi_value <= RSI_OVERSOLD:
                     signal = "🟡 RSI 14 LOW"
-                elif rsi_value >= 75:        # RSI_OVERBOUGHT cũ
+                elif rsi_value >= RSI_OVERBOUGHT:
                     signal = "🔴 RSI 14 HIGH"
                 else:
                     signal = "🟢 NEUTRAL"
@@ -154,132 +111,15 @@ async def scan_rsi_realtime():
         send_telegram_message(message)
         print(f"✅ Đã gửi {len(alerts)} tín hiệu realtime RSI 14")
 
-# ================== CÁC HÀM CŨ (không đụng) ==================
-def detect_rsi_midline_cross(closes, period: int = 14, level: float = 50):
-    series = calculate_rsi_series(closes, period)
-    if len(series) < 2:
-        return None
-    prev, curr = series[-2], series[-1]
-    if prev < level <= curr:
-        return ("up", prev, curr)
-    if prev >= level > curr:
-        return ("down", prev, curr)
-    return None
-
-def closed_closes_with_age(klines):
-    now_ms = time.time() * 1000
-    closed = [k for k in klines if k[6] < now_ms]
-    if not closed:
-        return [], None
-    age_minutes = (now_ms - closed[-1][6]) / 60000
-    return [float(k[4]) for k in closed], age_minutes
-
-def scan_market(market_label, base_url, klines_path, symbols):
-    alerts_sent = 0
-    for symbol in symbols:
-        triggered_rsi_1h = None
-        triggered_rsi_4h = None
-        rsi_cross_30m = None
-        rsi_cross_1h = None
-
-        try:
-            klines = get_klines(base_url, klines_path, symbol, INTERVAL, limit=HISTORY_LIMIT)
-            closes = [float(k[4]) for k in klines]
-            rsi_1h = calculate_rsi(closes, RSI_PERIOD)
-            if rsi_1h is not None and (rsi_1h <= RSI_OVERSOLD or rsi_1h >= RSI_OVERBOUGHT):
-                triggered_rsi_1h = rsi_1h
-                print(f"  -> [{market_label}] {symbol} RSI(1H)={rsi_1h}")
-            closed_closes_1h, age_1h = closed_closes_with_age(klines)
-            if age_1h is not None and age_1h <= FRESH_WINDOW_MINUTES:
-                rsi_cross_1h = detect_rsi_midline_cross(closed_closes_1h, RSI_PERIOD)
-                if rsi_cross_1h:
-                    print(f"  -> [{market_label}] {symbol} RSI(1H) cắt {rsi_cross_1h[0]} mốc {50}")
-        except Exception as e:
-            print(f"Lỗi {market_label} {INTERVAL}: {e}")
-        time.sleep(REQUEST_DELAY)
-
-        try:
-            klines_4h = get_klines(base_url, klines_path, symbol, INTERVAL_4H, limit=HISTORY_LIMIT)
-            closes_4h = [float(k[4]) for k in klines_4h]
-            rsi_4h = calculate_rsi(closes_4h, RSI_PERIOD)
-            if rsi_4h is not None and (rsi_4h <= RSI_OVERSOLD_4H or rsi_4h >= RSI_OVERBOUGHT_4H):
-                triggered_rsi_4h = rsi_4h
-                print(f"  -> [{market_label}] {symbol} RSI(4H)={rsi_4h}")
-        except Exception as e:
-            print(f"Lỗi {market_label} {INTERVAL_4H}: {e}")
-        time.sleep(REQUEST_DELAY)
-
-        try:
-            klines_30m = get_klines(base_url, klines_path, symbol, INTERVAL_30M, limit=HISTORY_LIMIT)
-            closed_closes_30m, age_30m = closed_closes_with_age(klines_30m)
-            if age_30m is not None and age_30m <= FRESH_WINDOW_MINUTES:
-                rsi_cross_30m = detect_rsi_midline_cross(closed_closes_30m, RSI_PERIOD)
-                if rsi_cross_30m:
-                    print(f"  -> [{market_label}] {symbol} RSI(30M) cắt {rsi_cross_30m[0]} mốc {50}")
-        except Exception as e:
-            print(f"Lỗi {market_label} {INTERVAL_30M}: {e}")
-        time.sleep(REQUEST_DELAY)
-
-        has_signal = (
-            triggered_rsi_1h is not None or
-            triggered_rsi_4h is not None or
-            rsi_cross_30m is not None or
-            rsi_cross_1h is not None
-        )
-        if has_signal:
-            parts = []
-            emojis = []
-            if triggered_rsi_1h is not None:
-                parts.append(f"RSI(1H): {triggered_rsi_1h}")
-                emojis.append("🟢" if triggered_rsi_1h <= RSI_OVERSOLD else "🔴")
-            if triggered_rsi_4h is not None:
-                parts.append(f"RSI(4H): {triggered_rsi_4h}")
-                emojis.append("🟢" if triggered_rsi_4h <= RSI_OVERSOLD_4H else "🔴")
-            if rsi_cross_30m is not None:
-                direction, prev, curr = rsi_cross_30m
-                word = "cắt lên" if direction == "up" else "cắt xuống"
-                parts.append(f"RSI(30M) {word} 50: {prev:.1f} ➜ {curr:.1f}")
-                emojis.append("🟢" if direction == "up" else "🔴")
-            if rsi_cross_1h is not None:
-                direction, prev, curr = rsi_cross_1h
-                word = "cắt lên" if direction == "up" else "cắt xuống"
-                parts.append(f"RSI(1H) {word} 50: {prev:.1f} ➜ {curr:.1f}")
-                emojis.append("🟢" if direction == "up" else "🔴")
-            unique_emojis = []
-            for e in emojis:
-                if e not in unique_emojis:
-                    unique_emojis.append(e)
-            msg = f"{''.join(unique_emojis)} <b>{symbol}</b> [{market_label}] - " + "; ".join(parts)
-            send_telegram_message(msg)
-            alerts_sent += 1
-    return alerts_sent
-
-# ================== MAIN ==================
+# ================== MAIN - CHỈ RUN REAL-TIME ==================
 async def main():
-    print("Bắt đầu quét (1 lần)...")
-    total_alerts = 0
-
-    # Futures cũ
-    futures_symbols = get_all_futures_usdt_symbols()
-    futures_set = set(futures_symbols)
-    if futures_symbols:
-        print(f"[Futures] Tổng số cặp USDT-M: {len(futures_symbols)}")
-        total_alerts += scan_market("FUTURES", BINANCE_FUTURES_BASE, "/fapi/v1/klines", futures_symbols)
-    else:
-        print("[Futures] Bỏ qua Futures.")
-
-    # Spot cũ
-    spot_symbols_all = get_all_spot_usdt_symbols()
-    spot_symbols = [s for s in spot_symbols_all if s not in futures_set]
-    skipped = len(spot_symbols_all) - len(spot_symbols)
-    print(f"[Spot] Tìm thấy {len(spot_symbols)} cặp (bỏ qua {skipped} cặp trùng Futures)")
-    total_alerts += scan_market("SPOT", BINANCE_SPOT_BASE, "/api/v3/klines", spot_symbols)
-
-    print(f"Xong. Đã gửi tổng cộng {total_alerts} cảnh báo.")
-
-    # ================== RSI 14 REAL-TIME ==================
-    print("Bắt đầu quét realtime RSI 14...")
-    await scan_rsi_realtime()
+    print("🚀 Bắt đầu chạy RSI 14 Real-time Futures (chỉ Futures)...")
+    while True:
+        try:
+            await scan_rsi_realtime()
+        except Exception as e:
+            print(f"Lỗi: {e}")
+        await asyncio.sleep(300)   # chạy mỗi 5 phút (có thể đổi thành 60 cho 1m)
 
 if __name__ == "__main__":
     asyncio.run(main())
