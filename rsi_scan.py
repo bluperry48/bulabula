@@ -30,7 +30,6 @@ def is_excluded_symbol(symbol: str) -> bool:
     return False  # Dễ dàng bật lại nếu cần
 
 def get_all_futures_usdt_symbols():
-    """Lấy danh sách cặp Futures USDT-M"""
     url = f"{BINANCE_FUTURES_BASE}/fapi/v1/exchangeInfo"
     try:
         r = requests.get(url, timeout=15)
@@ -45,7 +44,8 @@ def get_all_futures_usdt_symbols():
                 and not is_excluded_symbol(s["symbol"])
             ):
                 symbols.append(s["symbol"])
-        return sorted(symbols)
+        # Giới hạn để tránh rate limit (chạy được ~30-40 coin)
+        return sorted(symbols[:40])   # <--- thêm dòng này
     except Exception as e:
         print(f"[Futures] Không lấy được danh sách Futures: {e}")
         return []
@@ -82,10 +82,10 @@ async def scan_rsi_realtime():
         print("[Futures] Không lấy được danh sách Futures, bỏ qua realtime.")
         return
 
-    print(f"[Futures] Tìm thấy {len(futures_symbols)} cặp USDT Perpetual")
+    print(f"[Futures] Tìm thấy {len(futures_symbols)} cặp USDT Perpetual (chạy 40 coin)")
 
     alerts = []
-    for symbol in futures_symbols:
+    for i, symbol in enumerate(futures_symbols):
         try:
             klines = get_klines(BINANCE_FUTURES_BASE, "/fapi/v1/klines",
                                symbol, "5m", limit=50)
@@ -103,23 +103,16 @@ async def scan_rsi_realtime():
                 link = f"https://fapi.binance.com/en/futures/{symbol.replace('USDT', '')}?positionSide=LONG"
                 alerts.append(f"**{symbol}** | RSI: `{rsi_value:.1f}` | {signal}\n{link}")
 
-        except Exception:
-            continue
+            # Thêm sleep để tránh rate limit
+            await asyncio.sleep(0.3)
+
+        except Exception as e:
+            if "429" in str(e) or "rate limit" in str(e).lower():
+                print(f"[RATE LIMIT] Binance limit reached cho {symbol}. Dừng quét để tránh block.")
+                break
+            print(f"Lỗi {symbol}: {e}")
 
     if alerts:
         message = "📊 **RSI 14 REAL-TIME FUTURES**\n\n" + "\n\n".join(alerts)
         send_telegram_message(message)
         print(f"✅ Đã gửi {len(alerts)} tín hiệu realtime RSI 14")
-
-# ================== MAIN - CHỈ RUN REAL-TIME ==================
-async def main():
-    print("🚀 Bắt đầu chạy RSI 14 Real-time Futures (chỉ Futures)...")
-    while True:
-        try:
-            await scan_rsi_realtime()
-        except Exception as e:
-            print(f"Lỗi: {e}")
-        await asyncio.sleep(300)   # chạy mỗi 5 phút (có thể đổi thành 60 cho 1m)
-
-if __name__ == "__main__":
-    asyncio.run(main())
